@@ -1,0 +1,41 @@
+name: Crypto Daily Brief
+
+on:
+  schedule:
+    # 8am EST (UTC-5) / 9am EDT (UTC-4) — Mon–Fri
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch:  # allow manual trigger from GitHub Actions tab
+
+jobs:
+  podcast:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: python src/main.py
+
+      - name: Upload MP3 artifact (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podcast-mp3
+          path: output/*.mp3
+          retention-days: 7
