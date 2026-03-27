@@ -1,35 +1,36 @@
 """
-collector.py — Fetch and clean articles from RSS feeds.
+collector.py — Fetch today's newsletter edition from each source via Gmail IMAP.
 
 Sources:
-  - CoinTelegraph: summaries only in RSS; fetches full article body from URL
-  - The Defiant: full HTML in <content:encoded>
-  - Messari: full HTML in <content:encoded>
+  - Messari Unqualified Opinions
+  - The Defiant Newsletter
+  - CoinTelegraph Newsletter
 
-Returns a list of Article dicts per source, filtered to the last 24 hours.
+Each source's newsletter is delivered to the podcast Gmail inbox. This module
+connects via IMAP, finds today's email from each newsletter sender, and returns
+the cleaned plain-text body as an Article.
+
+Prerequisites:
+  - Subscribe to each newsletter using the EMAIL_ADDRESS Gmail account
+  - Set MESSARI_SENDER, DEFIANT_SENDER, COINTELEGRAPH_SENDER in .env to the
+    exact "From" address of each newsletter (check after first email arrives)
 """
 
-import time
+import imaplib
+import email
 import logging
+import os
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from email.header import decode_header as _decode_header
 
-import feedparser
-import requests
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-FEEDS = {
-    "cointelegraph": "https://cointelegraph.com/rss",
-    "defiant": "https://thedefiant.io/feed",
-    "messari": "https://messari.io/rss",
-}
-
-MAX_ARTICLES_PER_SOURCE = 5
-LOOKBACK_HOURS = 24
-REQUEST_TIMEOUT = 10
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CryptoPodcastBot/1.0)"}
+IMAP_HOST = "imap.gmail.com"
+IMAP_PORT = 993
+REQUEST_TIMEOUT = 30
 
 
 @dataclass
@@ -41,115 +42,186 @@ class Article:
     text: str  # plain text body
 
 
+# ---------------------------------------------------------------------------
+# HTML → plain text
+# ---------------------------------------------------------------------------
+
 def _html_to_text(html: str) -> str:
     """Strip HTML tags and collapse whitespace."""
     soup = BeautifulSoup(html, "lxml")
-    # Remove script/style noise
-    for tag in soup(["script", "style", "figure", "img"]):
+    for tag in soup(["script", "style", "figure", "img", "head"]):
         tag.decompose()
     text = soup.get_text(separator=" ")
-    # Collapse whitespace
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return " ".join(lines)
 
 
-def _parse_published(entry) -> datetime | None:
-    """Return a timezone-aware datetime from an RSS entry, or None."""
-    if hasattr(entry, "published_parsed") and entry.published_parsed:
-        return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-    return None
+# ---------------------------------------------------------------------------
+# Email body extraction
+# ---------------------------------------------------------------------------
+
+def _decode_str(value: str) -> str:
+    """Decode an RFC2047-encoded header string."""
+    parts = _decode_header(value)
+    decoded = []
+    for part, charset in parts:
+        if isinstance(part, bytes):
+            decoded.append(part.decode(charset or "utf-8", errors="replace"))
+        else:
+            decoded.append(part)
+    return "".join(decoded)
 
 
-def _is_recent(dt: datetime | None, hours: int = LOOKBACK_HOURS) -> bool:
-    if dt is None:
-        return True  # include if we can't determine age
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    return dt >= cutoff
+def _get_body(msg: email.message.Message) -> str:
+    """Extract the best available body from an email message (prefer HTML)."""
+    html_body = ""
+    text_body = ""
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            cd = str(part.get("Content-Disposition", ""))
+            if "attachment" in cd:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                content = payload.decode(charset, errors="replace")
+            except Exception:
+                continue
+            if ct == "text/html" and not html_body:
+                html_body = content
+            elif ct == "text/plain" and not text_body:
+                text_body = content
+    else:
+        charset = msg.get_content_charset() or "utf-8"
+        try:
+            payload = msg.get_payload(decode=True)
+            content = payload.decode(charset, errors="replace") if payload else ""
+        except Exception:
+            content = ""
+        if msg.get_content_type() == "text/html":
+            html_body = content
+        else:
+            text_body = content
+
+    if html_body:
+        return _html_to_text(html_body)
+    return text_body.strip()
 
 
-def _fetch_full_article(url: str) -> str:
-    """Fetch a webpage and return its main text content."""
+# ---------------------------------------------------------------------------
+# IMAP fetch
+# ---------------------------------------------------------------------------
+
+def _imap_connect() -> imaplib.IMAP4_SSL:
+    """Open an authenticated IMAP connection using env credentials."""
+    username = os.environ["EMAIL_FROM"]
+    password = os.environ["EMAIL_APP_PASSWORD"]
+    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    conn.login(username, password)
+    return conn
+
+
+def fetch_newsletter(source: str, sender: str) -> "Article | None":
+    """
+    Find today's newsletter from `sender` in the Gmail inbox and return it
+    as an Article. Returns None if no matching email is found today.
+    """
+    today = datetime.now(timezone.utc).strftime("%d-%b-%Y")  # e.g. "27-Mar-2026"
+    logger.info(f"Fetching {source} newsletter from inbox (sender: {sender})")
+
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
-        # Try common article content selectors
-        for selector in ["article", "main", '[class*="article"]', '[class*="content"]']:
-            container = soup.select_one(selector)
-            if container:
-                return _html_to_text(str(container))
-        return _html_to_text(resp.text)
+        conn = _imap_connect()
+        conn.select("INBOX")
+
+        # Search: from this sender, received on or after today
+        search_criteria = f'(FROM "{sender}" SINCE "{today}")'
+        status, data = conn.search(None, search_criteria)
+
+        if status != "OK" or not data[0]:
+            logger.warning(f"{source}: no newsletter found today (sender: {sender})")
+            conn.logout()
+            return None
+
+        # Take the last (most recent) matching message ID
+        msg_ids = data[0].split()
+        latest_id = msg_ids[-1]
+
+        # Fetch the full message
+        status, msg_data = conn.fetch(latest_id, "(RFC822)")
+        conn.logout()
+
+        if status != "OK" or not msg_data:
+            logger.warning(f"{source}: failed to fetch email body")
+            return None
+
+        raw = msg_data[0][1]
+        msg = email.message_from_bytes(raw)
+
+        subject = _decode_str(msg.get("Subject", f"{source} Newsletter"))
+        body = _get_body(msg)
+
+        if not body:
+            logger.warning(f"{source}: email body was empty")
+            return None
+
+        logger.info(f"{source}: fetched newsletter '{subject}' ({len(body)} chars)")
+
+        return Article(
+            source=source,
+            title=subject,
+            url="",  # email source — no URL
+            published=datetime.now(timezone.utc),
+            text=body[:8000],  # cap to keep tokens reasonable
+        )
+
     except Exception as e:
-        logger.warning(f"Failed to fetch full article from {url}: {e}")
-        return ""
+        logger.error(f"{source}: IMAP error — {e}")
+        return None
 
 
-def _get_content(entry, source: str) -> str:
-    """Extract text content from a feed entry."""
-    # Prefer content:encoded (full HTML)
-    if hasattr(entry, "content") and entry.content:
-        return _html_to_text(entry.content[0].value)
-    # For CoinTelegraph: only summary available, fetch full article
-    if source == "cointelegraph":
-        text = _fetch_full_article(entry.link)
-        if text:
-            return text
-    # Fall back to summary
-    if hasattr(entry, "summary") and entry.summary:
-        return _html_to_text(entry.summary)
-    return ""
-
-
-def fetch_source(name: str, url: str) -> list[Article]:
-    """Parse one RSS feed and return recent articles."""
-    logger.info(f"Fetching {name} from {url}")
-    try:
-        feed = feedparser.parse(url)
-    except Exception as e:
-        logger.error(f"Failed to parse {name} feed: {e}")
-        return []
-
-    articles = []
-    for entry in feed.entries[:20]:  # check up to 20 entries
-        published = _parse_published(entry)
-        if not _is_recent(published):
-            continue
-
-        text = _get_content(entry, name)
-        if not text:
-            continue
-
-        articles.append(Article(
-            source=name,
-            title=getattr(entry, "title", "Untitled"),
-            url=getattr(entry, "link", ""),
-            published=published or datetime.now(timezone.utc),
-            text=text[:4000],  # cap per-article text to keep tokens reasonable
-        ))
-
-        if len(articles) >= MAX_ARTICLES_PER_SOURCE:
-            break
-
-        # Small delay between article fetches to be polite
-        if name == "cointelegraph":
-            time.sleep(0.5)
-
-    logger.info(f"{name}: found {len(articles)} recent articles")
-    return articles
-
+# ---------------------------------------------------------------------------
+# Public interface
+# ---------------------------------------------------------------------------
 
 def collect_all() -> dict[str, list[Article]]:
-    """Fetch all sources. Returns dict keyed by source name."""
+    """
+    Fetch today's newsletter from each source via Gmail IMAP.
+    Returns dict keyed by source name, each value is a list of 0 or 1 Article.
+    """
+    senders = {
+        "messari":       os.environ.get("MESSARI_SENDER", ""),
+        "defiant":       os.environ.get("DEFIANT_SENDER", ""),
+        "cointelegraph": os.environ.get("COINTELEGRAPH_SENDER", ""),
+    }
+
     results = {}
-    for name, url in FEEDS.items():
-        results[name] = fetch_source(name, url)
+    for source, sender in senders.items():
+        if not sender:
+            logger.warning(f"{source}: sender address not configured — skipping")
+            results[source] = []
+            continue
+        article = fetch_newsletter(source, sender)
+        results[source] = [article] if article else []
+
     return results
 
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
     data = collect_all()
     for source, articles in data.items():
-        print(f"\n=== {source.upper()} ({len(articles)} articles) ===")
-        for a in articles:
-            print(f"  [{a.published.strftime('%H:%M')}] {a.title} (~{len(a.text)} chars)")
+        if articles:
+            a = articles[0]
+            print(f"\n=== {source.upper()} ===")
+            print(f"  Title: {a.title}")
+            print(f"  Body:  {len(a.text)} chars")
+            print(f"  Preview: {a.text[:200]}...")
+        else:
+            print(f"\n=== {source.upper()} — no newsletter found today ===")
